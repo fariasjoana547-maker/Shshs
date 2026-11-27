@@ -1,0 +1,262 @@
+name: Windows RDP Setup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          if (!(Test-Path $ts)) {
+              Invoke-WebRequest -Uri $url -OutFile $installer
+
+              if (!(Test-Path $installer) -or
+                  (Get-Item $installer).Length -eq 0) {
+                  throw "Download do Tailscale inválido."
+              }
+
+              $process = Start-Process msiexec.exe `
+                  -ArgumentList "/i `"$installer`" /qn /norestart" `
+                  -Wait -PassThru
+
+              Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+              if ($process.ExitCode -notin @(0, 3010)) {
+                  throw "Falha na instalação: $($process.ExitCode)"
+              }
+          }
+
+          if (!(Test-Path $ts)) {
+              throw "Tailscale.exe não encontrado."
+          }
+
+          $service = Get-Service -Name Tailscale -ErrorAction Stop
+
+          if ($service.Status -ne "Running") {
+              Start-Service Tailscale
+          }
+
+          Write-Host "Tailscale instalado."
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+              throw "Secret TAILSCALE_AUTH_KEY não configurado."
+          }
+
+          $ts = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          $ip = & $ts ip -4 2>$null |
+              Select-Object -First 1
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+              & $ts up `
+                  "--auth-key=$($env:TAILSCALE_AUTH_KEY)" `
+                  "--hostname=windows-rdp" `
+                  "--accept-dns=false"
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Erro ao conectar ao Tailscale."
+              }
+          }
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 30; $i++) {
+              $result = & $ts ip -4 2>$null
+              $ip = ($result | Select-Object -First 1)
+
+              if (![string]::IsNullOrWhiteSpace($ip)) {
+                  $ip = $ip.Trim()
+                  break
+              }
+
+              Start-Sleep -Seconds 2
+          }
+
+          if (!$ip) {
+              throw "IP Tailscale não foi atribuído."
+          }
+
+          "TAILSCALE_IP=$ip" | Out-File `
+              -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Tailscale conectado: $ip"
+
+      - name: Configure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+
+          if (!$principal.IsInRole(
+              [Security.Principal.WindowsBuiltInRole]::Administrator
+          )) {
+              throw "Execute o runner com permissões administrativas."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "Secret RDP_PASSWORD não configurado."
+          }
+
+          $password = ConvertTo-SecureString `
+              $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = Get-LocalUser -Name "rdpuser" `
+              -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+              New-LocalUser `
+                  -Name "rdpuser" `
+                  -Password $password `
+                  -Description "RDP User" `
+                  -PasswordNeverExpires
+          }
+          else {
+              Set-LocalUser `
+                  -Name "rdpuser" `
+                  -Password $password `
+                  -PasswordNeverExpires $true
+
+              Enable-LocalUser -Name "rdpuser"
+          }
+
+          $group = Get-LocalGroup -SID "S-1-5-32-555"
+          $userSid = (Get-LocalUser -Name "rdpuser").SID.Value
+
+          $members = Get-LocalGroupMember `
+              -Group $group.Name
+
+          if (!($members | Where-Object {
+              $_.SID.Value -eq $userSid
+          })) {
+              Add-LocalGroupMember `
+                  -Group $group.Name `
+                  -Member "rdpuser"
+          }
+
+          $adminGroup = Get-LocalGroup -SID "S-1-5-32-544"
+
+          $adminMembers = Get-LocalGroupMember `
+              -Group $adminGroup.Name
+
+          if (!($adminMembers | Where-Object {
+              $_.SID.Value -eq $userSid
+          })) {
+              Add-LocalGroupMember `
+                  -Group $adminGroup.Name `
+                  -Member "rdpuser"
+          }
+
+          $registry = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+
+          Set-ItemProperty `
+              -Path $registry `
+              -Name "fDenyTSConnections" `
+              -Value 0
+
+          Set-ItemProperty `
+              -Path "$registry\WinStations\RDP-Tcp" `
+              -Name "UserAuthentication" `
+              -Value 1
+
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+          Get-NetFirewallRule -Name "Tailscale-RDP-TCP" `
+              -ErrorAction SilentlyContinue |
+              Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+              -Name "Tailscale-RDP-TCP" `
+              -DisplayName "RDP through Tailscale" `
+              -Direction Inbound `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -RemoteAddress "100.64.0.0/10" `
+              -Action Allow `
+              -Profile Any
+
+          Write-Host "Configuração RDP concluída."
+
+      - name: Test RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $listening = $false
+
+          for ($i = 0; $i -lt 20; $i++) {
+              $listener = Get-NetTCPConnection `
+                  -LocalPort 3389 `
+                  -State Listen `
+                  -ErrorAction SilentlyContinue
+
+              if ($listener) {
+                  $listening = $true
+                  break
+              }
+
+              Start-Sleep -Seconds 3
+          }
+
+          if (!$listening) {
+              throw "O serviço RDP não está ouvindo na porta 3389."
+          }
+
+          Write-Host "Porta RDP está ouvindo."
+
+      - name: Display Connection Information
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## Windows RDP
+
+          - IP: $env:TAILSCALE_IP
+          - Port: 3389
+          - Username: rdpuser
+          - Password: GitHub Secret RDP_PASSWORD
+          - Network: Tailscale
+          - NLA: Enabled
+          - Status: Configured
+          "@
+
+          Add-Content $env:GITHUB_STEP_SUMMARY $summary
+
+          Write-Host "Configuração finalizada."
+          Write-Host "Conecte em: $($env:TAILSCALE_IP):3389"
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          # Mantém a VM ligada (o job termina = a máquina é destruída).
+          # Para encerrar antes, use "Cancel workflow".
+          $end = (Get-Date).AddMinutes(350)
+
+          while ((Get-Date) -lt $end) {
+              Write-Host "Ativo: $(Get-Date -Format 'HH:mm:ss')"
+              Start-Sleep -Seconds 60
+          }
